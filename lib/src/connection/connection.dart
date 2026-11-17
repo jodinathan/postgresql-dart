@@ -26,6 +26,11 @@ import 'resolved_settings.dart';
 
 final _runTxZoneKey = Object();
 
+PgException _streamingReplicationOpen() => PgException(
+  'Attempting to execute a statement while streaming replication is '
+  'open on this connection; call ReplicationStream.stop() first.',
+);
+
 const _debugLog = false;
 
 abstract class _PgSessionBase implements Session {
@@ -119,6 +124,9 @@ abstract class _PgSessionBase implements Session {
       throw PgException(
         'Attempting to execute query on connection while inside a `runTx` call.',
       );
+    }
+    if (_connection._replication != null) {
+      throw _streamingReplicationOpen();
     }
   }
 
@@ -503,6 +511,7 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
   bool _socketIsBroken = false;
 
   _PendingOperation? _pending;
+  _ReplicationStreamOperation? _replication;
   // Errors happening while a transaction is active will roll back the
   // transaction and should be reporte to the user.
   _TransactionSession? _activeTransaction;
@@ -586,6 +595,46 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
 
   @override
   Channels get channels => _channels;
+
+  @override
+  Future<ReplicationStream> startReplication(
+    String statement, {
+    ReplicationStreamSettings? settings,
+  }) async {
+    _verifyStateBeforeQuery();
+    if (_settings.replicationMode == ReplicationMode.none) {
+      throw PgException(
+        'startReplication needs a connection opened with a replication mode '
+        '(ConnectionSettings.replicationMode); this one has none.',
+      );
+    }
+    // Assigned before waiting for the operation lock, so that a statement
+    // queued in the meantime is refused instead of running into the stream.
+    final operation = _replication = _ReplicationStreamOperation(
+      this,
+      settings,
+    );
+    final Future<void> held;
+    try {
+      held = _withResource(() {
+        _pending = operation;
+        _send(QueryMessage(statement));
+        return operation._finished.future;
+      });
+    } catch (_) {
+      _replication = null;
+      rethrow;
+    }
+    unawaited(
+      held.then<void>((_) {}, onError: operation._failStart).whenComplete(() {
+        if (identical(_replication, operation)) {
+          _replication = null;
+        }
+        operation._release();
+      }),
+    );
+    return operation._started.future;
+  }
 
   @override
   PgConnectionImplementation get _connection => this;
@@ -772,6 +821,10 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
         '`runTx` call on the same connection.',
       );
     }
+    if (_replication != null) {
+      // The stream holds `_operationLock` until it stops.
+      throw _streamingReplicationOpen();
+    }
     final rsettings = ResolvedTransactionSettings(settings, _settings);
     // Keep this database is locked while the transaction is active. We do that
     // because on a protocol level, the entire connection is in a transaction.
@@ -867,6 +920,21 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
 
   @override
   Future<void> close({bool force = false}) async {
+    // An open replication stream holds `_operationLock` until it stops, so it
+    // has to end before the lock can be taken to send the Terminate message.
+    if (_replication case final stream? when !force) {
+      try {
+        await stream.stop().timeout(const Duration(seconds: 5));
+      } on TimeoutException {
+        return _close(
+          true,
+          PgException(
+            'Connection closed: the replication stream did not stop within '
+            '5 seconds.',
+          ),
+        );
+      }
+    }
     final ex = force ? PgException('Connection closed.') : null;
     await _close(force, ex);
   }
@@ -1351,11 +1419,10 @@ class _PgResultStreamSubscription
       case CopyBothResponseMessage():
         // This message indicates a successful start for Streaming Replication.
         // Hence, in this context, the query is complete. And from here on,
-        // the server will be streaming replication messages.
-        // But if the connection was used after this point to execute further
-        // queries, the server messages will be blocked.
-        // TODO(osaxma): Prevent executing queries when Streaming Replication
-        //               is ongoing
+        // the server will be streaming replication messages, which only reach
+        // a `ConnectionSettings.transformer`. The supported way to stream is
+        // `Connection.startReplication`, which keeps the connection busy and
+        // refuses other statements until the stream stops.
         _completeQuery();
       case EmptyQueryResponseMessage():
         break;
@@ -1650,6 +1717,200 @@ class _WaitForMessage<T extends ServerMessage> extends _PendingOperation {
       // protocol or something is very seriously broken. Treat this as a
       // critical flaw and close the connection as well.
       session._connection._closeAfterError();
+    }
+  }
+}
+
+class _ReplicationStreamOperation extends _PendingOperation
+    implements ReplicationStream {
+  _ReplicationStreamOperation(super.session, ReplicationStreamSettings? s)
+    : _statusInterval = s?.statusInterval ?? const Duration(seconds: 10),
+      _replyToKeepAlive = s?.replyToKeepAlive ?? true;
+
+  final Duration _statusInterval;
+  final bool _replyToKeepAlive;
+
+  /// Completes with this stream on CopyBothResponse, or with the error that
+  /// prevented the start.
+  final _started = Completer<ReplicationStream>();
+
+  /// Completes once the server ends the command (or the connection closes),
+  /// which releases the operation lock.
+  final _finished = Completer<void>();
+
+  /// Completes after the lock is released and the connection accepts
+  /// statements again.
+  final _released = Completer<void>();
+
+  final _messages = StreamController<ReplicationMessage>();
+  Timer? _statusTimer;
+  bool _streaming = false;
+  bool _stopping = false;
+  (Object, StackTrace)? _startError;
+  PgException? _closedBy;
+  LSN _received = LSN(0);
+  LSN _flushed = LSN(0);
+  LSN _applied = LSN(0);
+
+  @override
+  Stream<ReplicationMessage> get messages => _messages.stream;
+
+  @override
+  LSN get lastReceivedLsn => _received;
+
+  @override
+  void setFlushedLsn(LSN lsn) {
+    if (lsn.value > _flushed.value) _flushed = lsn;
+  }
+
+  @override
+  void setAppliedLsn(LSN lsn) {
+    if (lsn.value > _applied.value) _applied = lsn;
+  }
+
+  @override
+  Future<void> forceUpdateStatus({bool requestReply = false}) async {
+    _sendStatus(requestReply);
+  }
+
+  @override
+  Future<void> stop() {
+    if (!_stopping && !_released.isCompleted) {
+      _stopping = true;
+      _statusTimer?.cancel();
+      // Before CopyBothResponse, the CopyDone is sent once it arrives.
+      if (_streaming) _sendCopyDone();
+    }
+    return _released.future;
+  }
+
+  void _sendStatus(bool requestReply) {
+    if (!_streaming || _stopping) return;
+    final status = StandbyStatusUpdateMessage(
+      walWritePosition: _received,
+      walFlushPosition: _flushed,
+      walApplyPosition: _applied,
+      mustReply: requestReply,
+    );
+    _sendCopyMessage(
+      CopyDataMessage(status.asBytes(encoding: connection.encoding)),
+    );
+  }
+
+  void _sendCopyDone() => _sendCopyMessage(CopyDoneMessage(4));
+
+  void _sendCopyMessage(ClientMessage message) {
+    try {
+      connection._send(message);
+    } on PgException catch (e) {
+      // Also reached from the status timer, where nothing could catch it.
+      connection._closeAfterError(e);
+    }
+  }
+
+  void _endStreaming() {
+    _streaming = false;
+    _statusTimer?.cancel();
+  }
+
+  void _end() {
+    _endStreaming();
+    if (!_finished.isCompleted) _finished.complete();
+  }
+
+  /// Handles a failure of the operation itself (e.g. the connection closing
+  /// before the lock was acquired), which may never reach this operation.
+  void _failStart(Object error, StackTrace trace) {
+    _startError ??= (error, trace);
+    _end();
+  }
+
+  /// Settles [started] and [messages] once the connection is free again, so
+  /// that a caller reacting to them can use the connection right away.
+  void _release() {
+    if (!_started.isCompleted) {
+      final (error, trace) =
+          _startError ??
+          (
+            _closedBy ??
+                PgException(
+                  'The statement ended without starting streaming replication '
+                  '(no CopyBothResponse); startReplication expects a '
+                  'START_REPLICATION command.',
+                ),
+            StackTrace.current,
+          );
+      _started.completeError(error, trace);
+    } else if (_closedBy case final error?) {
+      _messages.addError(error);
+    }
+    unawaited(_messages.close());
+    _released.complete();
+  }
+
+  @override
+  void handleConnectionClosed(PgException? dueToException) {
+    _closedBy ??=
+        dueToException ??
+        PgException('Connection closed while streaming replication.');
+    _end();
+  }
+
+  @override
+  void handleError(PgException exception) {
+    if (_started.isCompleted) {
+      // The server left copy mode; the ReadyForQueryMessage ending the
+      // command follows.
+      _endStreaming();
+      _messages.addError(exception);
+    } else {
+      _startError ??= (exception, StackTrace.current);
+    }
+  }
+
+  @override
+  Future<void> handleMessage(ServerMessage message) async {
+    switch (message) {
+      case CopyBothResponseMessage():
+        _streaming = true;
+        _started.complete(this);
+        if (_stopping) {
+          _sendCopyDone();
+        } else {
+          _statusTimer = Timer.periodic(
+            _statusInterval,
+            (_) => _sendStatus(false),
+          );
+        }
+      case XLogDataMessage():
+        if (message.walEnd.value > _received.value) _received = message.walEnd;
+        _messages.add(message);
+      case PrimaryKeepAliveMessage():
+        if (message.walEnd.value > _received.value) _received = message.walEnd;
+        if (message.mustReply && _replyToKeepAlive) _sendStatus(false);
+        _messages.add(message);
+      case CopyDoneMessage():
+        // Both sides end CopyBoth with a CopyDone; answer when the server is
+        // the first one to send it.
+        if (!_stopping) {
+          _stopping = true;
+          _sendCopyDone();
+        }
+        _endStreaming();
+      case CommandCompleteMessage() ||
+          RowDescriptionMessage() ||
+          DataRowMessage() ||
+          EmptyQueryResponseMessage():
+        break;
+      case ReadyForQueryMessage():
+        _end();
+      default:
+        final exception = PgException(
+          'Unexpected message during replication: $message',
+        );
+        _closedBy ??= exception;
+        _end();
+        connection._closeAfterError(exception);
     }
   }
 }

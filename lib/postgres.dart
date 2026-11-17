@@ -328,6 +328,18 @@ abstract class Connection implements Session, SessionExecutor {
   /// `COMMIT` does not prove the commit happened; look at the status from
   /// before the `COMMIT` too.
   TransactionStatus get transactionStatus;
+
+  /// Starts streaming replication with [statement], a `START_REPLICATION`
+  /// command, on a connection opened with a [ReplicationMode] other than
+  /// [ReplicationMode.none].
+  ///
+  /// The returned [ReplicationStream] owns the connection until
+  /// [ReplicationStream.stop] completes or the connection closes: any other
+  /// statement on this connection throws a [PgException] in the meantime.
+  Future<ReplicationStream> startReplication(
+    String statement, {
+    ReplicationStreamSettings? settings,
+  });
 }
 
 abstract class ResultStream implements Stream<ResultRow> {
