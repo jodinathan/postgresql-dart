@@ -128,6 +128,42 @@ The library supports connecting to PostgreSQL using the [Streaming Replication P
 See [Connection][] documentation for more info.
 An example can also be found at the following repository: [postgresql-dart-replication-example][]
 
+`Connection.startReplication` runs a `START_REPLICATION` command on a connection
+opened with a `ReplicationMode` and returns a `ReplicationStream`: `messages`
+delivers the decoded replication messages, keepalives that ask for a reply are
+answered, and a Standby Status Update is sent every
+`ReplicationStreamSettings.statusInterval` (10 seconds by default). The server
+only releases WAL up to the position marked with `setFlushedLsn`. Until `stop()`
+completes, other statements on the connection throw a `PgException`.
+
+```dart
+final conn = await Connection.open(
+  endpoint,
+  settings: ConnectionSettings(
+    replicationMode: ReplicationMode.logical,
+    queryMode: QueryMode.simple,
+  ),
+);
+final slot = await conn.execute(
+  'CREATE_REPLICATION_SLOT my_slot TEMPORARY LOGICAL pgoutput NOEXPORT_SNAPSHOT',
+);
+final stream = await conn.startReplication(
+  'START_REPLICATION SLOT my_slot LOGICAL ${slot.single[1]} '
+  "(proto_version '1', publication_names 'my_publication', messages 'true')",
+);
+await for (final message in stream.messages) {
+  if (message is XLogDataLogicalMessage) {
+    final data = message.message;
+    if (data is CommitMessage) {
+      // the transaction is processed: let the server release its WAL
+      stream.setFlushedLsn(data.transactionEndLSN);
+    }
+  }
+}
+```
+
+The replication messages are exported by `package:postgres/messages.dart`.
+
 [Streaming Replication Protocol]: https://www.postgresql.org/docs/13/protocol-replication.html
 [Connection]: https://pub.dev/documentation/postgres/latest/postgres/Connection/Connection.html
 [postgresql-dart-replication-example]: https://github.com/osaxma/postgresql-dart-replication-example

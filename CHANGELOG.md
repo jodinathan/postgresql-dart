@@ -9,10 +9,13 @@
 - `Connection.runTx` also consults the server-reported transaction status: a transaction in a failed state is rolled back and a `PgException` is thrown.
 - `Connection.runTx` requires an idle connection: if a transaction (open or failed) was already started directly on the `Connection` (e.g. `BEGIN`), it throws a `PgException` and leaves that transaction alone.
 - The `queryTimeout` setting also covers the wait for the connection: a statement still queued behind a running operation when it expires fails with a `PgException` and is never sent, without affecting the running operation.
+- Logical decoding messages (`M`, from `pg_logical_emit_message` with pgoutput's `messages` option) are decoded as `LogicalDecodingMessage` instead of arriving as a raw `XLogDataMessage`.
 
 **Other changes:**
 
 - `Connection.transactionStatus` exposing the transaction state reported by the server.
+- Add `Connection.startReplication`, returning a `ReplicationStream` with the decoded replication messages, periodic Standby Status Updates (`ReplicationStreamSettings.statusInterval`), automatic replies to keepalives that ask for one, `setFlushedLsn`/`setAppliedLsn`, `forceUpdateStatus` and `stop`.
+- Statements on a connection with an open `ReplicationStream` throw a `PgException` instead of closing the connection.
 
 ## 3.6.0
 
