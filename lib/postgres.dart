@@ -276,6 +276,18 @@ abstract class Connection implements Session, SessionExecutor {
   ConnectionInfo get info;
 
   Channels get channels;
+
+  /// Starts streaming replication with [statement], a `START_REPLICATION`
+  /// command, on a connection opened with a [ReplicationMode] other than
+  /// [ReplicationMode.none].
+  ///
+  /// The returned [ReplicationStream] owns the connection until
+  /// [ReplicationStream.stop] completes or the connection closes: any other
+  /// statement on this connection throws a [PgException] in the meantime.
+  Future<ReplicationStream> startReplication(
+    String statement, {
+    ReplicationStreamSettings? settings,
+  });
 }
 
 abstract class ResultStream implements Stream<ResultRow> {
