@@ -88,6 +88,9 @@ LogicalReplicationMessage? tryParseLogicalReplicationMessage(
     case LogicalReplicationMessageTypes.truncate:
       return TruncateMessage._parse(reader);
 
+    case LogicalReplicationMessageTypes.message:
+      return LogicalDecodingMessage._parse(reader);
+
     case LogicalReplicationMessageTypes.unsupported:
       // wal2json messages starts with `{` as the first byte
       if (firstByte == '{'.codeUnits.single) {
@@ -143,6 +146,9 @@ Future<LogicalReplicationMessage?> tryAsyncParseLogicalReplicationMessage(
     case LogicalReplicationMessageTypes.truncate:
       return TruncateMessage._parse(reader);
 
+    case LogicalReplicationMessageTypes.message:
+      return LogicalDecodingMessage._parse(reader);
+
     case LogicalReplicationMessageTypes.unsupported:
       // wal2json messages starts with `{` as the first byte
       if (firstByte == '{'.codeUnits.single) {
@@ -170,6 +176,7 @@ enum LogicalReplicationMessageTypes {
   update('U'),
   delete('D'),
   truncate('T'),
+  message('M'),
   unsupported('');
 
   final String id;
@@ -835,6 +842,38 @@ class TruncateMessage implements LogicalReplicationMessage {
   @override
   String toString() =>
       'TruncateMessage(relationNum: $relationNum, options: $options, relationIds: $relationIds)';
+}
+
+/// A logical decoding message, written by `pg_logical_emit_message` and sent
+/// by pgoutput when the `messages` option is on.
+class LogicalDecodingMessage implements LogicalReplicationMessage {
+  /// The message type
+  late final baseMessage = LogicalReplicationMessageTypes.message;
+
+  /// Whether the message was emitted inside a transaction.
+  late final bool transactional;
+
+  /// The LSN of the message.
+  late final LSN lsn;
+
+  /// The prefix given to `pg_logical_emit_message`.
+  late final String prefix;
+
+  /// The content given to `pg_logical_emit_message`.
+  late final Uint8List content;
+
+  LogicalDecodingMessage._parse(PgByteDataReader reader) {
+    // reading order matters
+    transactional = reader.readUint8() == 1;
+    lsn = reader.readLSN();
+    prefix = reader.readNullTerminatedString();
+    final length = reader.readUint32();
+    content = reader.read(length);
+  }
+
+  @override
+  String toString() =>
+      'LogicalDecodingMessage(transactional: $transactional, lsn: $lsn, prefix: $prefix, content: $content)';
 }
 
 /// Extension contain commonly used methods within this file
