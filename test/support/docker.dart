@@ -199,7 +199,7 @@ Future<void> _startPostgresContainer({
 
   final dp = await startPostgres(
     name: containerName,
-    version: 'latest',
+    version: '18.7',
     pgPort: port,
     pgDatabase: 'postgres',
     pgUser: pgUser ?? 'postgres',
