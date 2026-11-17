@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.6.0+replication.1
+
+**Behavior changes:**
+
+- Logical decoding messages (`M`, from `pg_logical_emit_message` with pgoutput's `messages` option) are decoded as `LogicalDecodingMessage` instead of arriving as a raw `XLogDataMessage`.
+
+**Other changes:**
+
+- Add `Connection.startReplication`, returning a `ReplicationStream` with the decoded replication messages, periodic Standby Status Updates (`ReplicationStreamSettings.statusInterval`), automatic replies to keepalives that ask for one, `setFlushedLsn`/`setAppliedLsn`, `forceUpdateStatus` and `stop`.
+- Statements on a connection with an open `ReplicationStream` throw a `PgException` instead of closing the connection.
+
 ## 3.6.0
 
 **Behavior changes:**
